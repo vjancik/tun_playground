@@ -1,18 +1,19 @@
 // https://www.kernel.org/doc/Documentation/networking/tuntap.txt
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/if_tun.h
 
-use std::{ffi, mem};
+use std::mem;
 use std::os::{unix, raw};
-use nix;
+use nix::{sys::stat, fcntl, unistd};
 use anyhow::{anyhow, Result};
 
 type CaddrT = *const raw::c_char;
 
 const TUNSETIFF: u64 = nix::request_code_write!(b'T', 202, mem::size_of::<libc::c_int>());
+nix::ioctl_write_ptr_bad!(ioctl_tunsetiff, TUNSETIFF, Ifreq);
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct Ifreq {
+pub struct Ifreq {
     ifr_name: [raw::c_uchar; libc::IFNAMSIZ],
     ifr_ifru: IfrIfru,
 }
@@ -52,16 +53,8 @@ struct Tun {
 
 impl Drop for Tun {
     fn drop(&mut self) {
-        close(self.fd).ok();
+        unistd::close(self.fd).ok();
     }
-}
-
-
-
-fn errno_str() -> String {
-    let strerr = unsafe { libc::strerror(*libc::__errno_location()) };
-    let c_str = unsafe { ffi::CStr::from_ptr(strerr) };
-    c_str.to_string_lossy().into_owned()
 }
 
 fn tun_alloc(name: &str) -> Result<Tun> {
@@ -70,10 +63,7 @@ fn tun_alloc(name: &str) -> Result<Tun> {
         return Err(anyhow!("Tunnel name too long"));
     }
 
-    let fd = match unsafe { libc::open(b"/dev/net/tun\0".as_ptr() as _, libc::O_RDWR) } {
-        r if r < 0 => return Err(anyhow!(errno_str())),
-        fd => fd
-    };
+    let fd = fcntl::open("/dev/net/tun", fcntl::OFlag::O_RDWR, stat::Mode::empty())?;
 
     let mut ifr = Ifreq {
         ifr_name: [0; libc::IFNAMSIZ],
@@ -81,38 +71,21 @@ fn tun_alloc(name: &str) -> Result<Tun> {
             ifru_flags: (libc::IFF_TUN /* | libc::IFF_NO_PI | libc::IFF_MULTI_QUEUE*/) as _,
         }
     };
-
     ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
-    if unsafe { libc::ioctl(fd, TUNSETIFF, &ifr)} == -1 {
-        close(fd).ok();
-        return Err(anyhow!(errno_str()));
+
+    if let Err(error) = unsafe { ioctl_tunsetiff(fd, &ifr) } {
+        unistd::close(fd).ok();
+        return Err(error.into());
     }
 
     Ok(Tun { fd, _name: name.to_owned() })
 }
 
-#[inline]
-fn fnctl_getfl(fd: unix::io::RawFd) -> Result<i32> {
-    match unsafe { libc::fcntl(fd, libc::F_GETFL) } {
-        r if r < 0 => Err(anyhow!(errno_str())),
-        flags => Ok(flags),
-    }
-}
-
 fn set_non_blocking(fd: unix::io::RawFd) -> Result<()> {
-    let flags = fnctl_getfl(fd)?;
+    let flags = unsafe { fcntl::OFlag::from_bits_unchecked(fcntl::fcntl(fd, fcntl::FcntlArg::F_GETFL)?) };
 
-    match unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } {
-        r if r < 0 => Err(anyhow!(errno_str())),
-        _ => Ok(()),
-    }
-}
-
-fn close(fd: unix::io::RawFd) -> Result<()> {
-    match unsafe { libc::close(fd) } {
-        r if r < 0 => Err(anyhow!(errno_str())),
-        _ => Ok(()),
-    }
+    fcntl::fcntl(fd, fcntl::FcntlArg::F_SETFL(flags | fcntl::OFlag::O_NONBLOCK))?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -128,12 +101,8 @@ mod tests {
     use super::*;
 
     fn is_nonblock(fd: unix::io::RawFd) -> Result<bool> {
-        let flags = fnctl_getfl(fd)?;
-    
-        Ok(match flags & libc::O_NONBLOCK {
-            0 => false,
-            _ => true,
-        })
+        let flags = fcntl::OFlag::from_bits_truncate(fcntl::fcntl(fd, fcntl::FcntlArg::F_GETFL)?);
+        Ok(flags.intersects(fcntl::OFlag::O_NONBLOCK))
     }
 
     #[test]
