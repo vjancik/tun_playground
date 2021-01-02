@@ -2,9 +2,11 @@
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/if_tun.h
 
 use std::mem;
+use std::env;
 use std::os::{unix, raw};
 use nix::{sys::stat, fcntl, unistd};
 use anyhow::{anyhow, Result};
+use bytes;
 
 type CaddrT = *const raw::c_char;
 
@@ -47,7 +49,7 @@ pub struct Ifmap {
 }
 
 struct Tun {
-    _name: String,
+    _name: bytes::Bytes,
     fd: unix::io::RawFd,
 }
 
@@ -57,8 +59,8 @@ impl Drop for Tun {
     }
 }
 
-fn tun_alloc(name: &str) -> Result<Tun> {
-    let iface_name = name.as_bytes();
+fn tun_alloc(name: String) -> Result<Tun> {
+    let iface_name = bytes::Bytes::from(name);
     if iface_name.len() >= libc::IFNAMSIZ {
         return Err(anyhow!("Tunnel name too long"));
     }
@@ -68,19 +70,20 @@ fn tun_alloc(name: &str) -> Result<Tun> {
     let mut ifr = Ifreq {
         ifr_name: [0; libc::IFNAMSIZ],
         ifr_ifru: IfrIfru {
-            ifru_flags: (libc::IFF_TUN /* | libc::IFF_NO_PI | libc::IFF_MULTI_QUEUE*/) as _,
+            ifru_flags: (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_MULTI_QUEUE ) as _,
         }
     };
-    ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
+    ifr.ifr_name[..iface_name.len()].copy_from_slice(&iface_name);
 
     if let Err(error) = unsafe { ioctl_tunsetiff(fd, &ifr) } {
         unistd::close(fd).ok();
         return Err(error.into());
     }
 
-    Ok(Tun { fd, _name: name.to_owned() })
+    Ok(Tun { fd, _name: iface_name })
 }
 
+#[allow(dead_code)]
 fn set_non_blocking(fd: unix::io::RawFd) -> Result<()> {
     let flags = unsafe { fcntl::OFlag::from_bits_unchecked(fcntl::fcntl(fd, fcntl::FcntlArg::F_GETFL)?) };
 
@@ -89,10 +92,41 @@ fn set_non_blocking(fd: unix::io::RawFd) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let tun_iff = tun_alloc(&"tuntest1")?;
-    set_non_blocking(tun_iff.fd)?;
+    let mut args = env::args();
+    args.next();
+    let tun_name = args.next().expect("Missing tunnel name argument");
 
-    Ok(())
+    // default 1500 MTU TODO
+    let mut buf = [0u8; 1500];
+    let mut addr_buf = [0u8; 4];
+    // let mut addr_dest_buf = [0u8; 4];
+    let tun_iff = tun_alloc(tun_name)?;
+    // set_non_blocking(tun_iff.fd)?;
+
+    // naive ICMP request reply
+    loop {
+        let nread = unistd::read(tun_iff.fd, &mut buf)?;
+        if nread == 0 {
+            return Ok(());
+        }
+        // println!("Bytes read: {}", nread);
+
+        // swap source destination
+        addr_buf.copy_from_slice(&buf[12..16]);
+        let addr_dest_buf = unsafe { std::slice::from_raw_parts(&buf[16] , 4) };
+        buf[12..16].copy_from_slice(&addr_dest_buf);
+        buf[16..20].copy_from_slice(&addr_buf);
+
+        // change request to reply
+        buf[20] = 0;
+
+        let nwrite = unistd::write(tun_iff.fd, &mut buf[..nread])?;
+        if nwrite == 0 {
+            return Ok(());
+        }
+        // println!("Bytes written: {}", nwrite);
+    }
+    // Ok(())
 }
 
 
@@ -107,7 +141,7 @@ mod tests {
 
     #[test]
     fn test_non_blocking() -> Result<()> {
-        let tun_iff = tun_alloc(&"tuntest1")?;
+        let tun_iff = tun_alloc("tuntest1".to_owned())?;
         set_non_blocking(tun_iff.fd)?;
         assert_eq!(is_nonblock(tun_iff.fd)?, true);
         Ok(())

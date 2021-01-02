@@ -8,5 +8,6 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0.37"
+bytes = "1.0.0"
 libc = "0.2.81"
 nix = "0.19.1"
