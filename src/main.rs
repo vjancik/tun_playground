@@ -1,12 +1,14 @@
-use libc;
-use std::error;
-use std::os::{unix, raw};
-use std::ffi;
+// https://www.kernel.org/doc/Documentation/networking/tuntap.txt
+// https://github.com/torvalds/linux/blob/master/include/uapi/linux/if_tun.h
 
-type Result<T> = std::result::Result<T, Box<dyn error::Error>>;
+use std::{ffi, mem};
+use std::os::{unix, raw};
+use nix;
+use anyhow::{anyhow, Result};
+
 type CaddrT = *const raw::c_char;
 
-const TUNSETIFF: u64 = 0x4004_54ca;
+const TUNSETIFF: u64 = nix::request_code_write!(b'T', 202, mem::size_of::<libc::c_int>());
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -63,8 +65,13 @@ fn errno_str() -> String {
 }
 
 fn tun_alloc(name: &str) -> Result<Tun> {
+    let iface_name = name.as_bytes();
+    if iface_name.len() >= libc::IFNAMSIZ {
+        return Err(anyhow!("Tunnel name too long"));
+    }
+
     let fd = match unsafe { libc::open(b"/dev/net/tun\0".as_ptr() as _, libc::O_RDWR) } {
-        -1 => return Err(errno_str().into()),
+        r if r < 0 => return Err(anyhow!(errno_str())),
         fd => fd
     };
 
@@ -75,14 +82,10 @@ fn tun_alloc(name: &str) -> Result<Tun> {
         }
     };
 
-    let iface_name = name.as_bytes();
-    if iface_name.len() >= libc::IFNAMSIZ {
-        return Err("Tunnel name too long".into());
-    }
     ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
     if unsafe { libc::ioctl(fd, TUNSETIFF, &ifr)} == -1 {
         close(fd).ok();
-        return Err(errno_str().into());
+        return Err(anyhow!(errno_str()));
     }
 
     Ok(Tun { fd, _name: name.to_owned() })
@@ -91,42 +94,30 @@ fn tun_alloc(name: &str) -> Result<Tun> {
 #[inline]
 fn fnctl_getfl(fd: unix::io::RawFd) -> Result<i32> {
     match unsafe { libc::fcntl(fd, libc::F_GETFL) } {
-        -1 => Err(errno_str().into()),
+        r if r < 0 => Err(anyhow!(errno_str())),
         flags => Ok(flags),
     }
-}
-
-fn is_nonblock(fd: unix::io::RawFd) -> Result<bool> {
-    let flags = fnctl_getfl(fd)?;
-
-    Ok(match flags & libc::O_NONBLOCK {
-        0 => false,
-        _ => true,
-    })
 }
 
 fn set_non_blocking(fd: unix::io::RawFd) -> Result<()> {
     let flags = fnctl_getfl(fd)?;
 
     match unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } {
-        -1 => Err(errno_str().into()),
+        r if r < 0 => Err(anyhow!(errno_str())),
         _ => Ok(()),
     }
 }
 
 fn close(fd: unix::io::RawFd) -> Result<()> {
     match unsafe { libc::close(fd) } {
-        -1 => Err(errno_str().into()),
+        r if r < 0 => Err(anyhow!(errno_str())),
         _ => Ok(()),
     }
 }
 
 fn main() -> Result<()> {
     let tun_iff = tun_alloc(&"tuntest1")?;
-    println!("Tunnel is nonblocking: {}", is_nonblock(tun_iff.fd)?);
     set_non_blocking(tun_iff.fd)?;
-    println!("Tunnel is nonblocking: {}", is_nonblock(tun_iff.fd)?);
-
 
     Ok(())
 }
@@ -136,11 +127,28 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn is_nonblock(fd: unix::io::RawFd) -> Result<bool> {
+        let flags = fnctl_getfl(fd)?;
+    
+        Ok(match flags & libc::O_NONBLOCK {
+            0 => false,
+            _ => true,
+        })
+    }
+
     #[test]
     fn test_non_blocking() -> Result<()> {
         let tun_iff = tun_alloc(&"tuntest1")?;
         set_non_blocking(tun_iff.fd)?;
         assert_eq!(is_nonblock(tun_iff.fd)?, true);
+        Ok(())
+    }
+
+    const TUNSETIFF: u64 = 0x4004_54ca;
+
+    #[test]
+    fn test_tunsetiff_ioctl_code() -> Result<()> {
+        assert_eq!(super::TUNSETIFF, TUNSETIFF);
         Ok(())
     }
 }
