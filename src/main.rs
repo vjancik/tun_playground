@@ -1,8 +1,7 @@
 // https://www.kernel.org/doc/Documentation/networking/tuntap.txt
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/if_tun.h
 
-use std::mem;
-use std::env;
+use std::{mem, env, ptr};
 use std::os::{unix, raw};
 use nix::{sys::stat, fcntl, unistd};
 use anyhow::{anyhow, Result};
@@ -98,7 +97,6 @@ fn main() -> Result<()> {
 
     // default 1500 MTU TODO
     let mut buf = [0u8; 1500];
-    let mut addr_buf = [0u8; 4];
     // let mut addr_dest_buf = [0u8; 4];
     let tun_iff = tun_alloc(tun_name)?;
     // set_non_blocking(tun_iff.fd)?;
@@ -112,10 +110,7 @@ fn main() -> Result<()> {
         // println!("Bytes read: {}", nread);
 
         // swap source destination
-        addr_buf.copy_from_slice(&buf[12..16]);
-        let addr_dest_buf = unsafe { std::slice::from_raw_parts(&buf[16] , 4) };
-        buf[12..16].copy_from_slice(&addr_dest_buf);
-        buf[16..20].copy_from_slice(&addr_buf);
+        unsafe { ptr::swap_nonoverlapping(&mut buf[12], &mut buf[16], 4); }
 
         // change request to reply
         buf[20] = 0;
