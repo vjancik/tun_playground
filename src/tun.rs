@@ -21,6 +21,9 @@ nix::ioctl_write_ptr_bad!(ioctl_setaddr, libc::SIOCSIFADDR, Ifreq);
 nix::ioctl_read_bad!(ioctl_getnetmask, libc::SIOCGIFNETMASK, Ifreq);
 nix::ioctl_write_ptr_bad!(ioctl_setnetmask, libc::SIOCSIFNETMASK, Ifreq);
 
+nix::ioctl_read_bad!(ioctl_getflags, libc::SIOCGIFFLAGS, Ifreq);
+nix::ioctl_write_ptr_bad!(ioctl_setflags, libc::SIOCSIFFLAGS, Ifreq);
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct Ifreq {
@@ -144,6 +147,20 @@ impl Tun {
 
         self.ifreq.borrow_mut().ifr_ifru.ifru_netmask = c_sockaddr.to_owned();
         unsafe { ioctl_setnetmask(self._socket, &*self.ifreq.borrow_mut())?; }
+        Ok(self)
+    }
+
+    fn get_flags(&self) -> Result<libc::c_short> {
+        unsafe { ioctl_getflags(self._socket, &mut *self.ifreq.borrow_mut())?; }
+
+        Ok(unsafe { self.ifreq.borrow().ifr_ifru.ifru_flags })
+    }
+
+    pub fn set_up(self) -> Result<Tun> {
+        let flags = self.get_flags()?;
+        self.ifreq.borrow_mut().ifr_ifru.ifru_flags = flags | libc::IFF_UP as libc::c_short;
+        unsafe { ioctl_setflags(self._socket, &*self.ifreq.borrow_mut())?; }
+
         Ok(self)
     }
 }

@@ -42,7 +42,8 @@ fn main() -> Result<()> {
         .set_non_blocking()?
         .set_mtu(tun::MAX_SAFE_MTU as _)?
         .set_addr(tun_addr.parse().unwrap())?
-        .set_netmask(tun_mask.parse().unwrap())?;
+        .set_netmask(tun_mask.parse().unwrap())?
+        .set_up()?;
     
     // let mtu = tun_iff.get_mtu()?;
     // println!("Interface MTU is: {}", mtu);
