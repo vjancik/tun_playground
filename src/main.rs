@@ -3,7 +3,7 @@
 
 use std::{mem, env, ptr, result, cell};
 use std::os::{unix, raw};
-use nix::{sys::stat, fcntl, unistd, errno};
+use nix::{sys::socket, sys::stat, fcntl, unistd, errno};
 use anyhow::{anyhow, Result};
 use bytes;
 use mio;
@@ -95,17 +95,29 @@ impl Tun {
     }
 
     fn get_mtu(&self) -> Result<libc::c_int> {
+        // an apparently unitialized "placeholder" socket to facilitate the IOCTL call
+        use socket::{socket, AddressFamily, SockType, SockFlag};
+        let fd = socket(AddressFamily::Inet, SockType::Datagram, SockFlag::empty(), None)?;
+
         self.ifreq.borrow_mut().ifr_ifru.ifru_mtu = 0;
         unsafe { 
-            ioctl_getmtu(self.fd, &mut *self.ifreq.borrow_mut())?;
+            ioctl_getmtu(fd, &mut *self.ifreq.borrow_mut())?;
+            unistd::close(fd)?;
             Ok(self.ifreq.borrow().ifr_ifru.ifru_mtu)
         }
     }
 
     #[allow(dead_code)]
     fn set_mtu(self, mtu: libc::c_int) -> Result<Tun> {
+        use socket::{socket, AddressFamily, SockType, SockFlag};
+        let fd = socket(AddressFamily::Inet, SockType::Datagram, SockFlag::empty(), None)?;
+
         self.ifreq.borrow_mut().ifr_ifru.ifru_mtu = mtu;
-        unsafe { ioctl_setmtu(self.fd, &*self.ifreq.borrow_mut())? };
+        unsafe { 
+            ioctl_setmtu(fd, &*self.ifreq.borrow_mut())?;
+            unistd::close(fd)?;
+        }
+
         Ok(self)
     }
 }
@@ -144,7 +156,7 @@ fn main() -> Result<()> {
     // default 1500 MTU TODO
     let mut buf = [0u8; 1500];
     // let mut addr_dest_buf = [0u8; 4];
-    let tun_iff = Tun::new(tun_name)?.set_non_blocking()?;
+    let tun_iff = Tun::new(tun_name)?.set_non_blocking()?.set_mtu(555)?;
     let mtu = tun_iff.get_mtu()?;
     println!("Interface MTU is: {}", mtu);
 
@@ -221,8 +233,8 @@ mod tests {
 
     #[test]
     fn test_mtu() -> Result<()> {
-        let tun_iff = Tun::new("tuntest1".to_owned())?.set_mtu(999)?;
-        assert_eq!(tun_iff.get_mtu()?, 999);
+        let tun_iff = Tun::new("tuntest1".to_owned())?.set_mtu(499)?;
+        assert_eq!(tun_iff.get_mtu()?, 499);
         Ok(())
     }
 }
