@@ -175,6 +175,7 @@ dependencies = [
  "libc",
  "mio",
  "nix",
+ "socket2",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@ use bytes;
 
 type CaddrT = *const raw::c_char;
 
-pub const TUNSETIFF: u64 = nix::request_code_write!(b'T', 202, mem::size_of::<libc::c_int>());
+pub const TUNSETIFF: u32 = nix::request_code_write!(b'T', 202, mem::size_of::<libc::c_int>()) as _;
 // Maximum guaranteed non-drop reassembly size for IPv4, minus the IPv4 header size (without options), minus the UDP header size
 pub const MAX_SAFE_MTU: usize = 576 - 20 - 8;
 
