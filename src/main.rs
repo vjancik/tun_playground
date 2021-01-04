@@ -41,8 +41,8 @@ fn main() -> Result<()> {
     let tun_iff = tun::Tun::new(tun_name.to_owned())?
         .set_non_blocking()?
         .set_mtu(tun::MAX_SAFE_MTU as _)?
-        .set_addr(tun_addr.parse().unwrap())?
-        .set_netmask(tun_mask.parse().unwrap())?
+        .set_addr(tun_addr.parse()?)?
+        .set_netmask(tun_mask.parse()?)?
         .set_up()?;
     
     // let mtu = tun_iff.get_mtu()?;

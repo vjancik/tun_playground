@@ -69,6 +69,7 @@ pub struct Tun {
 
 impl Drop for Tun {
     fn drop(&mut self) {
+        unistd::close(self._socket).ok();
         unistd::close(self.fd).ok();
     }
 }
@@ -107,6 +108,7 @@ impl Tun {
         Ok(self)
     }
 
+    #[allow(dead_code)]
     pub fn get_mtu(&self) -> Result<libc::c_int> {
         self.ifreq.borrow_mut().ifr_ifru.ifru_mtu = 0;
         unsafe { 
@@ -122,9 +124,9 @@ impl Tun {
         Ok(self)
     }
 
-    pub fn set_addr(self, addr: std::net::SocketAddr) -> Result<Tun> {
+    pub fn set_addr(self, addr: std::net::Ipv4Addr) -> Result<Tun> {
         // TODO: could use a custom builder
-        let addr = socket::InetAddr::from_std(&addr);
+        let addr = socket::InetAddr::new(socket::IpAddr::V4(socket::Ipv4Addr::from_std(&addr)), 0);
         let sock_addr = socket::SockAddr::new_inet(addr);
         let (c_sockaddr, _) = sock_addr.as_ffi_pair();
 
