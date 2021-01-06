@@ -9,6 +9,8 @@ use socket2;
 use clap::{self, value_t};
 use num_cpus;
 use signal_hook;
+use tracing::{debug, Level};
+use tracing_subscriber::FmtSubscriber;
 
 mod tun;
 // mod cyclic;
@@ -38,6 +40,7 @@ impl Default for IoFlags {
 }
 
 
+#[tracing::instrument]
 fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is_server: bool, 
                      server_addr: net::SocketAddr, mut channel: mio::net::UnixDatagram) -> Result<()> 
 {
@@ -78,7 +81,8 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
         mio::Interest::READABLE.add(mio::Interest::WRITABLE))?;
     poll.registry().register(&mut channel, CHAN_TOKEN, mio::Interest::READABLE)?;
 
-    let mut client_addr: net::SocketAddr = "0.0.0.0:0".parse()?; // filled on first packet
+    let unset_addr: net::SocketAddr = "[::0]:0".parse()?;
+    let mut client_addr = unset_addr;
 
     let mut chan_buf = [0u8; 1];
     
@@ -102,13 +106,19 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
                         true => client_addr,
                         false => server_addr
                     };
-            
+                    if peer_addr == unset_addr {
+                        break
+                    }
                     match udp_sock.send_to(&tun_buf[..tun_unsent_frame_size], peer_addr) {
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             tun_iff_flags.should_read = false;
                             break
                         },
-                        Err(any) => Err(any),
+                        Err(any) => {
+                            debug!(desc = "udp_sock.send_to failed", peer = ?peer_addr,
+                                tun_unsent_frame_size);
+                            Err(any)
+                        },
                         Ok(_) => {
                             tun_iff_flags.should_read = true; 
                             Ok(())
@@ -160,6 +170,12 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
 }
 
 fn main() -> Result<()> {
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::DEBUG)
+        .with_writer(io::stderr).finish();
+
+    tracing::subscriber::set_global_default(subscriber)?;
+
     let matches = clap::App::new("tun_playground")
         .settings(&[clap::AppSettings::SubcommandRequired, clap::AppSettings::InferSubcommands])
         .subcommand(clap::SubCommand::with_name("server")

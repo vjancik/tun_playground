@@ -16,3 +16,5 @@ nix = "0.19.1"
 num_cpus = "1.13.0"
 signal-hook = { version = "0.3.2", features = ["extended-siginfo"] }
 socket2 = { version = "0.3.19", features = ["reuseport"] }
+tracing = "0.1.22"
+tracing-subscriber = "0.2.15"
