@@ -1,7 +1,7 @@
 // https://www.kernel.org/doc/Documentation/networking/tuntap.txt
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/if_tun.h
 
-use std::{io, net, thread, mem, sync::{self, atomic}, os::unix};
+use std::{io, cell, net, thread, mem, fmt, sync::{self, atomic}, os::unix, collections};
 use nix::{unistd, errno};
 use anyhow::{Result};
 use mio;
@@ -11,18 +11,10 @@ use num_cpus;
 use signal_hook;
 use tracing::{debug, Level};
 use tracing_subscriber::FmtSubscriber;
+use byteorder::{ByteOrder};
+use crossbeam_utils::sync::ShardedLock;
 
 mod tun;
-// mod cyclic;
-
-// naive ICMP request reply
-// fn icmp_handler(src: &mut [u8]) {
-//     // swap source destination
-//     unsafe { ptr::swap_nonoverlapping(&mut src[12], &mut src[16], 4); }
-
-//     // change request to reply
-//     src[20] = 0;
-// }
 
 const TUN_IFF: mio::Token = mio::Token(0);
 const PUBLIC_IFF: mio::Token = mio::Token(1);
@@ -39,17 +31,44 @@ impl Default for IoFlags {
     }
 }
 
+struct TunnelConfig {
+    tun_name: String,
+    tun_addr: net::Ipv4Addr,
+    tun_iff: Option<tun::Tun>,
+    tun_mask: u8,
+    port: u16,
+    thread_id: u8,
+    gateway: Option<net::SocketAddr>,
+    tun_to_udp: sync::Arc<ShardedLock<collections::HashMap<net::Ipv4Addr, net::SocketAddr>>>,
+    channel: cell::RefCell<mio::net::UnixDatagram>,
+}
 
-#[tracing::instrument]
-fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is_server: bool, 
-                     server_addr: net::SocketAddr, mut channel: mio::net::UnixDatagram) -> Result<()> 
+impl fmt::Debug for TunnelConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelConfig")
+         .field("tun_name", &self.tun_name)
+         .field("tun_addr", &self.tun_addr)
+         .field("tun_iff", &self.tun_iff)
+         .field("tun_mask", &self.tun_mask)
+         .field("port", &self.port)
+         .field("thread_id", &self.thread_id)
+         .field("gateway", &self.gateway)
+         .field("peer_table", &self.tun_to_udp)
+         .field("channel", &"UnixDatagram channel")
+         .finish()
+    }
+}
+
+#[tracing::instrument(err)]
+fn initialize_tunnel(cfg: TunnelConfig) -> Result<()> 
 {
-    let tun_iff = tun::Tun::new(tun_name)?
-        .set_non_blocking()?
-        .set_mtu(tun::MAX_SAFE_MTU as _)?
-        .set_addr(tun_addr)?
-        .set_netmask(tun_mask)?
-        .set_up()?;
+    let tun_iff = match cfg.thread_id {
+        0 => cfg.tun_iff.unwrap(),
+        _ => {
+            tun::Tun::new(cfg.tun_name)?
+                .set_non_blocking()?
+        }
+    };
     let mut tun_iff_flags: IoFlags = Default::default();
     let mut tun_unsent_frame_size = 0;
     let mut tun_buf = [0u8; tun::MAX_SAFE_MTU];
@@ -64,12 +83,7 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
     let mut udp_iff_flags: IoFlags = Default::default();
     let mut udp_unsent_frame_size = 0;
     let mut udp_buf = [0u8; tun::MAX_SAFE_MTU];
-    if is_server {
-        let port = server_addr.port();
-        udp_sock.bind(&format!{"[::0]:{}", port}.parse::<net::SocketAddr>()?.into())?;
-    } else {
-        udp_sock.bind(&"[::0]:0".parse::<net::SocketAddr>()?.into())?;
-    }
+    udp_sock.bind(&format!{"[::0]:{}", cfg.port}.parse::<net::SocketAddr>()?.into())?;
     let mut udp_sock = mio::net::UdpSocket::from_std(udp_sock.into_udp_socket());
     
     let mut poll = mio::Poll::new()?;
@@ -79,10 +93,7 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
         mio::Interest::READABLE.add(mio::Interest::WRITABLE))?;
     poll.registry().register(&mut udp_sock, PUBLIC_IFF, 
         mio::Interest::READABLE.add(mio::Interest::WRITABLE))?;
-    poll.registry().register(&mut channel, CHAN_TOKEN, mio::Interest::READABLE)?;
-
-    let unset_addr: net::SocketAddr = "[::0]:0".parse()?;
-    let mut client_addr = unset_addr;
+    poll.registry().register(&mut *cfg.channel.borrow_mut(), CHAN_TOKEN, mio::Interest::READABLE)?;
 
     let mut chan_buf = [0u8; 1];
     
@@ -99,26 +110,21 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
                             any => any,
                         }?;
                     }
-
-                    // println!("Writing {} bytes from TUN to UDP socket", nread);
-                    // TODO: Address table for multiple clients
-                    let peer_addr = match is_server {
-                        true => client_addr,
-                        false => server_addr
+                    let tun_dest_ip: net::Ipv4Addr = byteorder::BigEndian::read_u32(&tun_buf[16..20]).into();
+                    let peer_addr = match cfg.tun_to_udp.read().unwrap().get(&tun_dest_ip) {
+                        Some(addr) => addr.clone(),
+                        _ => match &cfg.gateway {
+                            Some(gateway) => gateway.clone(),
+                            _ => continue
+                        }
                     };
-                    if peer_addr == unset_addr {
-                        break
-                    }
+                    
                     match udp_sock.send_to(&tun_buf[..tun_unsent_frame_size], peer_addr) {
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             tun_iff_flags.should_read = false;
                             break
                         },
-                        Err(any) => {
-                            debug!(desc = "udp_sock.send_to failed", peer = ?peer_addr,
-                                tun_unsent_frame_size);
-                            Err(any)
-                        },
+                        Err(any) => Err(any),
                         Ok(_) => {
                             tun_iff_flags.should_read = true; 
                             Ok(())
@@ -136,12 +142,13 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
                         }?;
                         udp_unsent_frame_size = nread;
 
-                        if is_server {
-                            client_addr = addr;
+                        let tun_src_ip: net::Ipv4Addr = byteorder::BigEndian::read_u32(&udp_buf[12..16]).into();
+                        if !cfg.tun_to_udp.read().unwrap().contains_key(&tun_src_ip) {
+                            debug!(msg = "unknown peer, adding", ?tun_src_ip);
+                            cfg.tun_to_udp.write().unwrap().insert(tun_src_ip, addr);
                         }
                     }
 
-                    // println!("Writing {} bytes from UDP socket to TUN", nread);
                     match unistd::write(tun_iff.fd, &udp_buf[..udp_unsent_frame_size]) {
                         Err(nix::Error::Sys(errno::EWOULDBLOCK)) => {
                             udp_iff_flags.should_read = false;
@@ -157,7 +164,7 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
             }
             else if event.token() == CHAN_TOKEN {
                 loop {
-                    channel.recv(&mut chan_buf)?;
+                    cfg.channel.borrow_mut().recv(&mut chan_buf)?;
                     let signal = unsafe { mem::transmute::<u8, i8>(chan_buf[0])};
                     if signal == -1 {
                         break 'event_loop;
@@ -177,38 +184,48 @@ fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     let matches = clap::App::new("tun_playground")
-        .settings(&[clap::AppSettings::SubcommandRequired, clap::AppSettings::InferSubcommands])
-        .subcommand(clap::SubCommand::with_name("server")
-            .arg(clap::Arg::with_name("port").long("port").value_name("PORT").required(true))
-        )
-        .subcommand(clap::SubCommand::with_name("client")
-            .arg(clap::Arg::with_name("server").long("server").value_name("SERVER").required(true)
-                .help("public IP:port server address"))
-        )
+        // .settings(&[clap::AppSettings::SubcommandRequired, clap::AppSettings::InferSubcommands])
+        // .subcommand(clap::SubCommand::with_name("server"))
+        // .subcommand(clap::SubCommand::with_name("client")
+        //     .arg(clap::Arg::with_name("server_public").long("serv_pub").value_name("PUBLIC").required(true)
+        //         .help("public IP:port server UDP socket"))
+        //     .arg(clap::Arg::with_name("server_virtual").long("serv_virt").value_name("VIRTUAL").required(true))
+        // )
         .arg(clap::Arg::with_name("tun").long("tun").value_name("NAME").required(true)
             .help("TUN interface name"))
         .arg(clap::Arg::with_name("mask").long("mask").value_name("MASK").default_value("24")
             .help("Subnet mask of the tunnel interface"))
         .arg(clap::Arg::with_name("virtual").long("virtual").value_name("ADDRESS").required(true)
             .help("IP address on the tunnel interface"))
+        .arg(clap::Arg::with_name("port").long("port").value_name("PORT").required(true))
+        .arg(clap::Arg::with_name("gateway").long("gw").value_name("ADDRESS")
+            .help("Public address of a peer that acts like a gateway, without a gateway a node can't \
+            initiate communication first."))
         .get_matches();
 
-    let tun_name = matches.value_of("tun").unwrap();
+    let tun_name = matches.value_of("tun").unwrap().to_owned();
     let tun_addr = clap::value_t!(matches, "virtual", net::Ipv4Addr)?;
     let tun_mask = clap::value_t!(matches, "mask", u8)?;
+    let tun_to_udp = sync::Arc::new(ShardedLock::new(collections::HashMap::new()));
+    let port = clap::value_t!(matches, "port", u16)?;
 
-    let (is_server, server_addr) = match matches.subcommand() {
-        ("server", Some(subc_m)) => {
-            let port = clap::value_t!(subc_m, "port", u16)?;
-            let server_addr = format!("0.0.0.0:{}", port).parse()?;
-            (true, server_addr)
-        },
-        ("client", Some(subc_m)) => {
-            let server_addr = clap::value_t!(subc_m, "server", net::SocketAddr)?;
-            (false, server_addr)
-        },
-        (_, _) => Err(anyhow::anyhow!("Failed to correctly parse arguments"))?
+    let gateway = match matches.value_of("gateway") {
+        Some(_) => Some(clap::value_t!(matches, "gateway", net::SocketAddr)?),
+        _ => None
     };
+
+    // if let Some(subc_m) = matches.subcommand_matches("client") {
+    //     let server_public = clap::value_t!(subc_m, "server_public", net::SocketAddr)?;
+    //     let server_virtual = clap::value_t!(subc_m, "server_virtual", net::Ipv4Addr)?;
+    //     tun_to_udp.write().unwrap().insert(server_virtual, server_public);
+    // }
+
+    let mut tun_iff = Some(tun::Tun::new(tun_name.clone())?
+        .set_non_blocking()?
+        .set_mtu(tun::MAX_SAFE_MTU as _)?
+        .set_addr(tun_addr)?
+        .set_netmask(tun_mask)?
+        .set_up()?);
     
     use signal_hook::{
         flag, 
@@ -229,9 +246,8 @@ fn main() -> Result<()> {
     let mut thread_channels = Vec::<unix::net::UnixDatagram>::with_capacity(ncpus);
 
 
-
-    for _ in 0..ncpus {
-        let tun_name = tun_name.to_owned();
+    for thread_id in 0..ncpus as u8 {
+        let tun_name = tun_name.clone();
 
         let (sender, receiver) = unix::net::UnixDatagram::pair()?;
         sender.set_nonblocking(true)?;
@@ -240,12 +256,13 @@ fn main() -> Result<()> {
         let receiver = mio::net::UnixDatagram::from_std(receiver);
         thread_channels.push(sender);
 
+        let cfg = TunnelConfig { thread_id, tun_name, tun_addr, tun_mask, port, gateway,
+            tun_iff: tun_iff.take(),
+            tun_to_udp: tun_to_udp.clone(),
+            channel: cell::RefCell::new(receiver) };
+
         threads.push(Some(thread::spawn(move || -> Result<()> {
-            let result = initialize_tunnel(tun_name, tun_addr, tun_mask, is_server, server_addr, receiver);
-            if result.is_err() {
-                eprintln!("Thread exited with an error");
-            }
-            result
+            initialize_tunnel(cfg)
         })));
     }
 

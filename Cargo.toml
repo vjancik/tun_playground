@@ -8,8 +8,10 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0.37"
+byteorder = "1.3.4"
 bytes = "1.0.0"
 clap = "2.33.3"
+crossbeam-utils = "0.8.1"
 libc = "0.2.81"
 mio = { version = "0.7.7", features = ["os-poll", "os-ext", "udp"] }
 nix = "0.19.1"

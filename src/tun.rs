@@ -1,10 +1,10 @@
-use std::{mem, cell};
+use std::{mem, cell, fmt};
 use std::os::{unix, raw};
 use nix::{sys::socket, sys::stat, fcntl, unistd};
 use anyhow::{anyhow, Result};
 use bytes;
 
-type CaddrT = *const raw::c_char;
+// type CaddrT = *const raw::c_char;
 
 pub const TUNSETIFF: u32 = nix::request_code_write!(b'T', 202, mem::size_of::<libc::c_int>()) as _;
 // Maximum guaranteed non-drop reassembly size for IPv4, 
@@ -46,7 +46,7 @@ pub union IfrIfru {
     pub ifru_map: Ifmap,
     pub ifru_slave: [raw::c_uchar; libc::IFNAMSIZ],
     pub ifru_newname: [raw::c_uchar; libc::IFNAMSIZ],
-    pub ifru_data: CaddrT,
+    // pub ifru_data: CaddrT,
 }
 
 #[repr(C)]
@@ -61,11 +61,19 @@ pub struct Ifmap {
 }
 
 pub struct Tun {
-    pub _name: bytes::Bytes,
+    pub name: bytes::Bytes,
     _socket: unix::io::RawFd,
     // slightly inefficient, not in the hot path, Cell::update would be prefered on nightly
     ifreq: cell::RefCell<Ifreq>,
     pub fd: unix::io::RawFd,
+}
+
+impl fmt::Debug for Tun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tun")
+         .field("name", &self.name)
+         .finish()
+    }
 }
 
 impl Drop for Tun {
@@ -101,7 +109,7 @@ impl Tun {
         use socket::{socket, AddressFamily, SockType, SockFlag};
         let sock_fd = socket(AddressFamily::Inet, SockType::Datagram, SockFlag::empty(), None)?;
     
-        Ok(Tun { fd, _name: iface_name, ifreq: cell::RefCell::new(ifr), _socket: sock_fd })
+        Ok(Tun { fd, name: iface_name, ifreq: cell::RefCell::new(ifr), _socket: sock_fd })
     }
 
     pub fn set_non_blocking(self) -> Result<Tun> {

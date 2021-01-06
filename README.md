@@ -6,7 +6,7 @@ Virtual network over a UDP tunnel PoC demonstration.
 `tun_playground --tun tunclient1 --virtual 10.0.0.2 client --server <IP:port>`
 
 ### Performance
-Benchmarked using `iperf3`with baseline throughput (directly) of `93Mbit/s` achieved a throughput of `80Mbit/s` on a local `100Mbit/s` rated wired connection.
+Benchmarked using `iperf`with baseline throughput (directly) of `93Mbit/s` achieved a throughput of `82Mbit/s` on a local `100Mbit/s` rated wired connection.
 ```
 iperf3 -c 10.0.0.1 -t 30 -i 10 -P 8
 ```
@@ -21,3 +21,6 @@ iperf3 -c 10.0.0.1 -t 30 -i 10 -P 8
 ### Extensions
 - [ ] NAT traversal for P2P connections
 - [ ] WireGuard protocol implementation
+
+#### Notes
+`iperf3` has a buggy TCP handshake code, reverted to `iperf` (version 2)
