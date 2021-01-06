@@ -1,7 +1,7 @@
 // https://www.kernel.org/doc/Documentation/networking/tuntap.txt
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/if_tun.h
 
-use std::{io, net, thread, mem, sync::{self, atomic}};
+use std::{io, net, thread, mem, sync::{self, atomic}, os::unix};
 use nix::{unistd, errno};
 use anyhow::{Result};
 use mio;
@@ -55,7 +55,7 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
     // println!("Interface MTU is: {}", mtu);
     
     use socket2::{Socket, Domain, Type, Protocol};
-    let udp_sock = Socket::new(Domain::ipv4(), Type::dgram().non_blocking(), Some(Protocol::udp()))?;
+    let udp_sock = Socket::new(Domain::ipv6(), Type::dgram().non_blocking(), Some(Protocol::udp()))?;
     udp_sock.set_reuse_address(true)?;
     udp_sock.set_reuse_port(true)?;
     let mut udp_iff_flags: IoFlags = Default::default();
@@ -63,9 +63,9 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
     let mut udp_buf = [0u8; tun::MAX_SAFE_MTU];
     if is_server {
         let port = server_addr.port();
-        udp_sock.bind(&format!{"0.0.0.0:{}", port}.parse::<net::SocketAddr>()?.into())?;
+        udp_sock.bind(&format!{"[::0]:{}", port}.parse::<net::SocketAddr>()?.into())?;
     } else {
-        udp_sock.bind(&"0.0.0.0:0".parse::<net::SocketAddr>()?.into())?;
+        udp_sock.bind(&"[::0]:0".parse::<net::SocketAddr>()?.into())?;
     }
     let mut udp_sock = mio::net::UdpSocket::from_std(udp_sock.into_udp_socket());
     
@@ -199,33 +199,42 @@ fn main() -> Result<()> {
         consts::TERM_SIGNALS,
         iterator::{SignalsInfo, exfiltrator::WithOrigin}};
     
-    { // valgrind reports memory leak
-        let term_sig = sync::Arc::new(atomic::AtomicBool::new(false));
-        for sig in TERM_SIGNALS {
-            flag::register_conditional_shutdown(*sig, 1, sync::Arc::clone(&term_sig))?;
-            flag::register(*sig, sync::Arc::clone(&term_sig))?;
-        }
+    // valgrind reports memory leak
+    let term_sig = sync::Arc::new(atomic::AtomicBool::new(false));
+    for sig in TERM_SIGNALS {
+        flag::register_conditional_shutdown(*sig, 1, sync::Arc::clone(&term_sig))?;
+        flag::register(*sig, sync::Arc::clone(&term_sig))?;
     }
+    
     let mut signals = SignalsInfo::<WithOrigin>::new(TERM_SIGNALS)?;
 
     let ncpus = num_cpus::get();
     let mut threads = Vec::<Option<thread::JoinHandle<Result<()>>>>::with_capacity(ncpus);
-    let mut thread_channels = Vec::<mio::net::UnixDatagram>::with_capacity(ncpus);
+    let mut thread_channels = Vec::<unix::net::UnixDatagram>::with_capacity(ncpus);
 
 
 
     for _ in 0..ncpus {
         let tun_name = tun_name.to_owned();
-        let (sender, receiver) = mio::net::UnixDatagram::pair()?;
+
+        let (sender, receiver) = unix::net::UnixDatagram::pair()?;
+        sender.set_nonblocking(true)?;
+        receiver.set_nonblocking(true)?;
+
+        let receiver = mio::net::UnixDatagram::from_std(receiver);
         thread_channels.push(sender);
 
         threads.push(Some(thread::spawn(move || -> Result<()> {
-            initialize_tunnel(tun_name, tun_addr, tun_mask, is_server, server_addr, receiver)
+            let result = initialize_tunnel(tun_name, tun_addr, tun_mask, is_server, server_addr, receiver);
+            if result.is_err() {
+                eprintln!("Thread exited with an error");
+            }
+            result
         })));
     }
 
     for info in &mut signals {
-        eprintln!("Received a signal {:?}", info);
+        // eprintln!("Received a signal {:?}", info);
         if TERM_SIGNALS.contains(&info.signal) {
             eprintln!("Terminating");
 
@@ -233,17 +242,17 @@ fn main() -> Result<()> {
             chan_buf[0] = unsafe { mem::transmute::<i8, u8>(-1) };
 
             for i in 0..ncpus {
-                thread_channels[i].send(&chan_buf)?;
+                // best effort send
+                thread_channels[i].send(&chan_buf).ok();
             }
             break;
         }
     }
 
     for i in 0..ncpus {
-        if let Err(err) = threads[i].take().unwrap().join() {
-            eprintln!("{:?}", err);
+        if let Err(err) = threads[i].take().unwrap().join().unwrap() {
+            eprintln!("Thread {}: {:?}", i, err);
         }
-        // println!("Thread {} exited.", i);
     }
 
     Ok(())
