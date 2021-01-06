@@ -136,7 +136,7 @@ impl Tun {
         Ok(self)
     }
 
-    pub fn set_netmask(self, netmask: u32) -> Result<Tun> {
+    pub fn set_netmask(self, netmask: u8) -> Result<Tun> {
         // TODO: somebody save this API from itself, thank you
         use bytes::BufMut;
         let mut buf = vec![];
