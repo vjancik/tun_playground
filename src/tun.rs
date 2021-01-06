@@ -7,7 +7,8 @@ use bytes;
 type CaddrT = *const raw::c_char;
 
 pub const TUNSETIFF: u32 = nix::request_code_write!(b'T', 202, mem::size_of::<libc::c_int>()) as _;
-// Maximum guaranteed non-drop reassembly size for IPv4, minus the IPv4 header size (without options), minus the UDP header size
+// Maximum guaranteed non-drop reassembly size for IPv4, 
+// minus the IPv4 header size (without options), minus the UDP header size
 pub const MAX_SAFE_MTU: usize = 576 - 20 - 8;
 
 nix::ioctl_write_ptr_bad!(ioctl_tunsetiff, TUNSETIFF, Ifreq);
@@ -167,7 +168,9 @@ impl Tun {
     }
 }
 
-// fn result_into<T, E: Into<anyhow::Error>>(res: result::Result<T, E>) -> result::Result<T, anyhow::Error> {
+// fn result_into<T, E: Into<anyhow::Error>>(res: result::Result<T, E>) 
+//     -> result::Result<T, anyhow::Error> 
+// {
 //     match res {
 //         Err(error) => Err(error.into()),
 //         Ok(val) => Ok(val)

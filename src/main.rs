@@ -1,13 +1,14 @@
 // https://www.kernel.org/doc/Documentation/networking/tuntap.txt
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/if_tun.h
 
-use std::{io, net, thread};
+use std::{io, net, thread, mem, sync::{self, atomic}};
 use nix::{unistd, errno};
 use anyhow::{Result};
 use mio;
 use socket2;
 use clap::{self, value_t};
 use num_cpus;
+use signal_hook;
 
 mod tun;
 // mod cyclic;
@@ -23,6 +24,7 @@ mod tun;
 
 const TUN_IFF: mio::Token = mio::Token(0);
 const PUBLIC_IFF: mio::Token = mio::Token(1);
+const CHAN_TOKEN: mio::Token = mio::Token(2);
 
 struct IoFlags {
     should_read: bool,
@@ -35,7 +37,10 @@ impl Default for IoFlags {
     }
 }
 
-fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is_server: bool, server_addr: net::SocketAddr) -> Result<()> {
+
+fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is_server: bool, 
+                     server_addr: net::SocketAddr, mut channel: mio::net::UnixDatagram) -> Result<()> 
+{
     let tun_iff = tun::Tun::new(tun_name)?
         .set_non_blocking()?
         .set_mtu(tun::MAX_SAFE_MTU as _)?
@@ -67,12 +72,17 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
     let mut poll = mio::Poll::new()?;
     let mut events = mio::Events::with_capacity(1000);
     
-    poll.registry().register(&mut mio::unix::SourceFd(&tun_iff.fd), TUN_IFF, mio::Interest::READABLE.add(mio::Interest::WRITABLE))?;
-    poll.registry().register(&mut udp_sock, PUBLIC_IFF, mio::Interest::READABLE.add(mio::Interest::WRITABLE))?;
+    poll.registry().register(&mut mio::unix::SourceFd(&tun_iff.fd), TUN_IFF, 
+        mio::Interest::READABLE.add(mio::Interest::WRITABLE))?;
+    poll.registry().register(&mut udp_sock, PUBLIC_IFF, 
+        mio::Interest::READABLE.add(mio::Interest::WRITABLE))?;
+    poll.registry().register(&mut channel, CHAN_TOKEN, mio::Interest::READABLE)?;
 
     let mut client_addr: net::SocketAddr = "0.0.0.0:0".parse()?; // filled on first packet
+
+    let mut chan_buf = [0u8; 1];
     
-    loop {
+    'event_loop: loop {
         poll.poll(&mut events, None)?;
 
         for event in events.iter() {
@@ -106,7 +116,7 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
                     }?;
                 }
             } 
-            if event.token() == PUBLIC_IFF {
+            else if event.token() == PUBLIC_IFF {
                 // UDP read / write handler
                 loop {
                     if udp_iff_flags.should_read {
@@ -135,8 +145,18 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
                     }?;
                 }
             }
+            else if event.token() == CHAN_TOKEN {
+                loop {
+                    channel.recv(&mut chan_buf)?;
+                    let signal = unsafe { mem::transmute::<u8, i8>(chan_buf[0])};
+                    if signal == -1 {
+                        break 'event_loop;
+                    }
+                }
+            }
         }
     }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -173,21 +193,57 @@ fn main() -> Result<()> {
         },
         (_, _) => Err(anyhow::anyhow!("Failed to correctly parse arguments"))?
     };
+    
+    use signal_hook::{
+        flag, 
+        consts::TERM_SIGNALS,
+        iterator::{SignalsInfo, exfiltrator::WithOrigin}};
+    
+    { // valgrind reports memory leak
+        let term_sig = sync::Arc::new(atomic::AtomicBool::new(false));
+        for sig in TERM_SIGNALS {
+            flag::register_conditional_shutdown(*sig, 1, sync::Arc::clone(&term_sig))?;
+            flag::register(*sig, sync::Arc::clone(&term_sig))?;
+        }
+    }
+    let mut signals = SignalsInfo::<WithOrigin>::new(TERM_SIGNALS)?;
 
     let ncpus = num_cpus::get();
     let mut threads = Vec::<Option<thread::JoinHandle<Result<()>>>>::with_capacity(ncpus);
+    let mut thread_channels = Vec::<mio::net::UnixDatagram>::with_capacity(ncpus);
+
+
 
     for _ in 0..ncpus {
         let tun_name = tun_name.to_owned();
+        let (sender, receiver) = mio::net::UnixDatagram::pair()?;
+        thread_channels.push(sender);
+
         threads.push(Some(thread::spawn(move || -> Result<()> {
-            initialize_tunnel(tun_name, tun_addr, tun_mask, is_server, server_addr)
+            initialize_tunnel(tun_name, tun_addr, tun_mask, is_server, server_addr, receiver)
         })));
+    }
+
+    for info in &mut signals {
+        eprintln!("Received a signal {:?}", info);
+        if TERM_SIGNALS.contains(&info.signal) {
+            eprintln!("Terminating");
+
+            let mut chan_buf = [0u8; 1];
+            chan_buf[0] = unsafe { mem::transmute::<i8, u8>(-1) };
+
+            for i in 0..ncpus {
+                thread_channels[i].send(&chan_buf)?;
+            }
+            break;
+        }
     }
 
     for i in 0..ncpus {
         if let Err(err) = threads[i].take().unwrap().join() {
-            println!("{:?}", err);
+            eprintln!("{:?}", err);
         }
+        // println!("Thread {} exited.", i);
     }
 
     Ok(())

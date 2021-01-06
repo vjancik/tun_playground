@@ -14,4 +14,5 @@ libc = "0.2.81"
 mio = { version = "0.7.7", features = ["os-poll", "os-ext", "udp"] }
 nix = "0.19.1"
 num_cpus = "1.13.0"
+signal-hook = { version = "0.3.2", features = ["extended-siginfo"] }
 socket2 = { version = "0.3.19", features = ["reuseport"] }
