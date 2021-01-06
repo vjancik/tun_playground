@@ -6,7 +6,7 @@ use nix::{unistd, errno};
 use anyhow::{Result};
 use mio;
 use socket2;
-use clap;
+use clap::{self, value_t};
 use num_cpus;
 
 mod tun;
@@ -141,24 +141,38 @@ fn initialize_tunnel(tun_name: String, tun_addr: net::Ipv4Addr, tun_mask: u8, is
 
 fn main() -> Result<()> {
     let matches = clap::App::new("tun_playground")
-        .arg(clap::Arg::with_name("server").long("server").conflicts_with("client").required_unless("client"))
-        .arg(clap::Arg::with_name("client").long("client").conflicts_with("server").required_unless("server"))
+        .settings(&[clap::AppSettings::SubcommandRequired, clap::AppSettings::InferSubcommands])
+        .subcommand(clap::SubCommand::with_name("server")
+            .arg(clap::Arg::with_name("port").long("port").value_name("PORT").required(true))
+        )
+        .subcommand(clap::SubCommand::with_name("client")
+            .arg(clap::Arg::with_name("server").long("server").value_name("SERVER").required(true)
+                .help("public IP:port server address"))
+        )
         .arg(clap::Arg::with_name("tun").long("tun").value_name("NAME").required(true)
             .help("TUN interface name"))
-        .arg(clap::Arg::with_name("public").long("public").value_name("ADDRESS").required(true)
-            .help("public IP:port server address"))
-        .arg(clap::Arg::with_name("virtual").long("virtual").value_name("ADDRESS").required(true)
-            .help("IP address on the tunnel interface"))
         .arg(clap::Arg::with_name("mask").long("mask").value_name("MASK").default_value("24")
             .help("Subnet mask of the tunnel interface"))
+        .arg(clap::Arg::with_name("virtual").long("virtual").value_name("ADDRESS").required(true)
+            .help("IP address on the tunnel interface"))
         .get_matches();
 
     let tun_name = matches.value_of("tun").unwrap();
-    let tun_addr = matches.value_of("virtual").unwrap().parse::<net::Ipv4Addr>()?;
-    let tun_mask = matches.value_of("mask").unwrap().parse::<u8>()?;
+    let tun_addr = clap::value_t!(matches, "virtual", net::Ipv4Addr)?;
+    let tun_mask = clap::value_t!(matches, "mask", u8)?;
 
-    let is_server = matches.is_present("server");
-    let server_addr = matches.value_of("public").unwrap().parse::<net::SocketAddr>()?;
+    let (is_server, server_addr) = match matches.subcommand() {
+        ("server", Some(subc_m)) => {
+            let port = clap::value_t!(subc_m, "port", u16)?;
+            let server_addr = format!("0.0.0.0:{}", port).parse()?;
+            (true, server_addr)
+        },
+        ("client", Some(subc_m)) => {
+            let server_addr = clap::value_t!(subc_m, "server", net::SocketAddr)?;
+            (false, server_addr)
+        },
+        (_, _) => Err(anyhow::anyhow!("Failed to correctly parse arguments"))?
+    };
 
     let ncpus = num_cpus::get();
     let mut threads = Vec::<Option<thread::JoinHandle<Result<()>>>>::with_capacity(ncpus);
