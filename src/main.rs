@@ -53,7 +53,8 @@ impl fmt::Debug for TunnelConfig {
          .field("port", &self.port)
          .field("thread_id", &self.thread_id)
          .field("gateway", &self.gateway)
-         .field("peer_table", &self.tun_to_udp)
+         // TODO: doesn't print properly?
+         .field("peer_table", &*self.tun_to_udp.read().unwrap())
          .field("channel", &"UnixDatagram channel")
          .finish()
     }
@@ -115,7 +116,11 @@ fn initialize_tunnel(cfg: TunnelConfig) -> Result<()>
                         Some(addr) => addr.clone(),
                         _ => match &cfg.gateway {
                             Some(gateway) => gateway.clone(),
-                            _ => continue
+                            _ => {
+                                debug!(msg = "unknown peer", ?tun_dest_ip);
+                                continue
+                            }
+
                         }
                     };
                     
@@ -149,17 +154,40 @@ fn initialize_tunnel(cfg: TunnelConfig) -> Result<()>
                         }
                     }
 
-                    match unistd::write(tun_iff.fd, &udp_buf[..udp_unsent_frame_size]) {
-                        Err(nix::Error::Sys(errno::EWOULDBLOCK)) => {
-                            udp_iff_flags.should_read = false;
-                            break
-                        },
-                        Err(any) => Err(any),
-                        Ok(_) => {
-                            udp_iff_flags.should_read = true;
-                            Ok(())
-                        },
-                    }?;
+                    let tun_dst_ip: net::Ipv4Addr = byteorder::BigEndian::read_u32(&udp_buf[16..20]).into();
+                    match tun_dst_ip == cfg.tun_addr {
+                        true => {
+                            match unistd::write(tun_iff.fd, &udp_buf[..udp_unsent_frame_size]) {
+                                Err(nix::Error::Sys(errno::EWOULDBLOCK)) => {
+                                    udp_iff_flags.should_read = false;
+                                    break
+                                },
+                                Err(any) => Err(any),
+                                Ok(_) => {
+                                    udp_iff_flags.should_read = true;
+                                    Ok(())
+                                },
+                            }?;
+                        }
+                        false => {
+                            if let Some(dst_ip) = cfg.tun_to_udp.read().unwrap().get(&tun_dst_ip) {
+                                // TODO: MAJOR replication occuring
+                                match udp_sock.send_to(&udp_buf[..udp_unsent_frame_size], dst_ip.clone()) {
+                                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                        tun_iff_flags.should_read = false;
+                                        break
+                                    },
+                                    Err(any) => Err(any),
+                                    Ok(_) => {
+                                        tun_iff_flags.should_read = true; 
+                                        Ok(())
+                                    },
+                                }?;
+                            // TODO: gateway forward
+                            } else { continue }
+                        }
+                    }
+
                 }
             }
             else if event.token() == CHAN_TOKEN {
