@@ -29,5 +29,13 @@ iperf -c 10.0.0.1 -t 30 -i 10 -P 8
 - [ ] NAT traversal for P2P connections
 - [ ] WireGuard protocol implementation
 
+### Platforms
+Tested on:
+```
+x86_64-unknown-linux-gnu
+aarch64-linux-android (*)
+```
+**\*** Through **Termux** on a rooted Android. Works either built with `cross` or **termux** distributed package `rust`.
+
 #### Notes
 `iperf3` has a buggy TCP handshake code, reverted to `iperf` (version 2)

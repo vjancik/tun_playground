@@ -83,6 +83,13 @@ impl Drop for Tun {
     }
 }
 
+const IFF_MULTI_QUEUE: libc::c_int = 0x0100;
+
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+const CLONE_DEV: &str = "/dev/net/tun";
+#[cfg(target_os = "android")]
+const CLONE_DEV: &str = "/dev/tun";
+
 impl Tun {
     pub fn new(name: String) -> Result<Tun> {
         let iface_name = bytes::Bytes::from(name);
@@ -90,12 +97,12 @@ impl Tun {
             return Err(anyhow!("Tunnel name too long"));
         }
     
-        let fd = fcntl::open("/dev/net/tun", fcntl::OFlag::O_RDWR, stat::Mode::empty())?;
+        let fd = fcntl::open(CLONE_DEV, fcntl::OFlag::O_RDWR, stat::Mode::empty())?;
     
         let mut ifr = Ifreq {
             ifr_name: [0; libc::IFNAMSIZ],
             ifr_ifru: IfrIfru {
-                ifru_flags: (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_MULTI_QUEUE ) as _,
+                ifru_flags: (libc::IFF_TUN | libc::IFF_NO_PI | IFF_MULTI_QUEUE ) as _,
             }
         };
         ifr.ifr_name[..iface_name.len()].copy_from_slice(&iface_name);

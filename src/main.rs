@@ -129,7 +129,19 @@ fn initialize_tunnel(cfg: TunnelConfig) -> Result<()>
                             tun_iff_flags.should_read = false;
                             break
                         },
-                        Err(any) => Err(any),
+                        Err(error) if error.kind() == io::ErrorKind::Other => {
+                            if let Some(e_num) = io::Error::last_os_error().raw_os_error() {
+                                if errno::Errno::from_i32(e_num) == errno::Errno::ENETUNREACH {
+                                    tun_iff_flags.should_read = false;
+                                    break
+                                }
+                            }
+                            Err(error)
+                        },
+                        Err(any) => {
+                            debug!(msg = "unknown send_to error", err = ?any.kind());
+                            Err(any)
+                        },
                         Ok(_) => {
                             tun_iff_flags.should_read = true; 
                             Ok(())
@@ -148,9 +160,20 @@ fn initialize_tunnel(cfg: TunnelConfig) -> Result<()>
                         udp_unsent_frame_size = nread;
 
                         let tun_src_ip: net::Ipv4Addr = byteorder::BigEndian::read_u32(&udp_buf[12..16]).into();
-                        if !cfg.tun_to_udp.read().unwrap().contains_key(&tun_src_ip) {
+
+                        let addr_tb = cfg.tun_to_udp.read().unwrap();
+                        if !addr_tb.contains_key(&tun_src_ip) {
                             debug!(msg = "unknown peer, adding", ?tun_src_ip);
+                            drop(addr_tb);
                             cfg.tun_to_udp.write().unwrap().insert(tun_src_ip, addr);
+                        } else {
+                            let old_addr = addr_tb.get(&tun_src_ip).unwrap().clone();
+                            // peer's IP address changed - unsecure
+                            if old_addr != addr { 
+                                debug!(msg = "updating peer's address", ?old_addr, ?addr, ?tun_src_ip);
+                                drop(addr_tb);
+                                cfg.tun_to_udp.write().unwrap().insert(tun_src_ip, addr);
+                            }
                         }
                     }
 
@@ -177,7 +200,19 @@ fn initialize_tunnel(cfg: TunnelConfig) -> Result<()>
                                         tun_iff_flags.should_read = false;
                                         break
                                     },
-                                    Err(any) => Err(any),
+                                    Err(error) if error.kind() == io::ErrorKind::Other => {
+                                        if let Some(e_num) = io::Error::last_os_error().raw_os_error() {
+                                            if errno::Errno::from_i32(e_num) == errno::Errno::ENETUNREACH {
+                                                tun_iff_flags.should_read = false;
+                                                break
+                                            }
+                                        }
+                                        Err(error)
+                                    },
+                                    Err(any) => {
+                                        debug!(msg = "unknown send_to error", err = ?any.kind());
+                                        Err(any)
+                                    },
                                     Ok(_) => {
                                         tun_iff_flags.should_read = true; 
                                         Ok(())
