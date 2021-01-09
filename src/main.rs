@@ -292,9 +292,12 @@ fn main() -> Result<()> {
     
     // valgrind reports memory leak
     let term_sig = sync::Arc::new(atomic::AtomicBool::new(false));
+    let mut sig_handlers = Vec::new();
     for sig in TERM_SIGNALS {
-        flag::register_conditional_shutdown(*sig, 1, sync::Arc::clone(&term_sig))?;
-        flag::register(*sig, sync::Arc::clone(&term_sig))?;
+        let handler1 = flag::register_conditional_shutdown(*sig, 1, sync::Arc::clone(&term_sig))?;
+        let handler2 = flag::register(*sig, sync::Arc::clone(&term_sig))?;
+        sig_handlers.push(handler1);
+        sig_handlers.push(handler2);
     }
     
     let mut signals = SignalsInfo::<WithOrigin>::new(TERM_SIGNALS)?;
@@ -350,6 +353,10 @@ fn main() -> Result<()> {
 
     for i in 0..ncpus {
         threads[i].take().unwrap().join().unwrap()?;
+    }
+
+    for handler in sig_handlers.into_iter() {
+        signal_hook::low_level::unregister(handler);
     }
 
     Ok(())
