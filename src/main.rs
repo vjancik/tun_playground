@@ -1,7 +1,8 @@
 // https://www.kernel.org/doc/Documentation/networking/tuntap.txt
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/if_tun.h
 
-use std::{io, cell, net, thread, mem, fmt, sync::{self, atomic}, os::unix, collections};
+use std::{io, cell, net, thread, mem, fmt, process, time,
+    sync::{self, atomic}, os::unix, collections};
 use nix::{unistd, errno};
 use anyhow::{Result};
 use mio;
@@ -9,10 +10,10 @@ use socket2;
 use clap::{self, value_t};
 use num_cpus;
 use signal_hook;
-use tracing::{debug, Level};
+use tracing::{debug, error, info};
 use tracing_subscriber::FmtSubscriber;
 use byteorder::{ByteOrder};
-use crossbeam_utils::sync::ShardedLock;
+use parking_lot::RwLock;
 
 mod tun;
 
@@ -39,7 +40,7 @@ struct TunnelConfig {
     port: u16,
     thread_id: u8,
     gateway: Option<net::SocketAddr>,
-    tun_to_udp: sync::Arc<ShardedLock<collections::HashMap<net::Ipv4Addr, net::SocketAddr>>>,
+    tun_to_udp: sync::Arc<RwLock<collections::HashMap<net::Ipv4Addr, net::SocketAddr>>>,
     channel: cell::RefCell<mio::net::UnixDatagram>,
 }
 
@@ -54,13 +55,12 @@ impl fmt::Debug for TunnelConfig {
          .field("thread_id", &self.thread_id)
          .field("gateway", &self.gateway)
          // TODO: doesn't print properly?
-         .field("peer_table", &*self.tun_to_udp.read().unwrap())
+         .field("peer_table", &*self.tun_to_udp.read())
          .field("channel", &"UnixDatagram channel")
          .finish()
     }
 }
 
-#[tracing::instrument(err)]
 fn initialize_tunnel(cfg: TunnelConfig) -> Result<()> 
 {
     let tun_iff = match cfg.thread_id {
@@ -112,7 +112,7 @@ fn initialize_tunnel(cfg: TunnelConfig) -> Result<()>
                         }?;
                     }
                     let tun_dest_ip: net::Ipv4Addr = byteorder::BigEndian::read_u32(&tun_buf[16..20]).into();
-                    let peer_addr = match cfg.tun_to_udp.read().unwrap().get(&tun_dest_ip) {
+                    let peer_addr = match cfg.tun_to_udp.read().get(&tun_dest_ip) {
                         Some(addr) => addr.clone(),
                         _ => match &cfg.gateway {
                             Some(gateway) => gateway.clone(),
@@ -138,10 +138,7 @@ fn initialize_tunnel(cfg: TunnelConfig) -> Result<()>
                             }
                             Err(error)
                         },
-                        Err(any) => {
-                            debug!(msg = "unknown send_to error", err = ?any.kind());
-                            Err(any)
-                        },
+                        Err(any) => Err(any),
                         Ok(_) => {
                             tun_iff_flags.should_read = true; 
                             Ok(())
@@ -161,18 +158,18 @@ fn initialize_tunnel(cfg: TunnelConfig) -> Result<()>
 
                         let tun_src_ip: net::Ipv4Addr = byteorder::BigEndian::read_u32(&udp_buf[12..16]).into();
 
-                        let addr_tb = cfg.tun_to_udp.read().unwrap();
+                        let addr_tb = cfg.tun_to_udp.read();
                         if !addr_tb.contains_key(&tun_src_ip) {
-                            debug!(msg = "unknown peer, adding", ?tun_src_ip);
+                            info!(msg = "unknown peer, adding", ?tun_src_ip);
                             drop(addr_tb);
-                            cfg.tun_to_udp.write().unwrap().insert(tun_src_ip, addr);
+                            cfg.tun_to_udp.write().insert(tun_src_ip, addr);
                         } else {
                             let old_addr = addr_tb.get(&tun_src_ip).unwrap().clone();
                             // peer's IP address changed - unsecure
                             if old_addr != addr { 
-                                debug!(msg = "updating peer's address", ?old_addr, ?addr, ?tun_src_ip);
+                                info!(msg = "updating peer's address", ?old_addr, ?addr, ?tun_src_ip);
                                 drop(addr_tb);
-                                cfg.tun_to_udp.write().unwrap().insert(tun_src_ip, addr);
+                                cfg.tun_to_udp.write().insert(tun_src_ip, addr);
                             }
                         }
                     }
@@ -193,7 +190,7 @@ fn initialize_tunnel(cfg: TunnelConfig) -> Result<()>
                             }?;
                         }
                         false => {
-                            if let Some(dst_ip) = cfg.tun_to_udp.read().unwrap().get(&tun_dst_ip) {
+                            if let Some(dst_ip) = cfg.tun_to_udp.read().get(&tun_dst_ip) {
                                 // TODO: MAJOR replication occuring
                                 match udp_sock.send_to(&udp_buf[..udp_unsent_frame_size], dst_ip.clone()) {
                                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -209,10 +206,7 @@ fn initialize_tunnel(cfg: TunnelConfig) -> Result<()>
                                         }
                                         Err(error)
                                     },
-                                    Err(any) => {
-                                        debug!(msg = "unknown send_to error", err = ?any.kind());
-                                        Err(any)
-                                    },
+                                    Err(any) => Err(any) ,
                                     Ok(_) => {
                                         tun_iff_flags.should_read = true; 
                                         Ok(())
@@ -241,7 +235,8 @@ fn initialize_tunnel(cfg: TunnelConfig) -> Result<()>
 
 fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::DEBUG)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_thread_ids(true).without_time()
         .with_writer(io::stderr).finish();
 
     tracing::subscriber::set_global_default(subscriber)?;
@@ -269,7 +264,7 @@ fn main() -> Result<()> {
     let tun_name = matches.value_of("tun").unwrap().to_owned();
     let tun_addr = clap::value_t!(matches, "virtual", net::Ipv4Addr)?;
     let tun_mask = clap::value_t!(matches, "mask", u8)?;
-    let tun_to_udp = sync::Arc::new(ShardedLock::new(collections::HashMap::new()));
+    let tun_to_udp = sync::Arc::new(RwLock::new(collections::HashMap::new()));
     let port = clap::value_t!(matches, "port", u16)?;
 
     let gateway = match matches.value_of("gateway") {
@@ -280,7 +275,7 @@ fn main() -> Result<()> {
     // if let Some(subc_m) = matches.subcommand_matches("client") {
     //     let server_public = clap::value_t!(subc_m, "server_public", net::SocketAddr)?;
     //     let server_virtual = clap::value_t!(subc_m, "server_virtual", net::Ipv4Addr)?;
-    //     tun_to_udp.write().unwrap().insert(server_virtual, server_public);
+    //     tun_to_udp.write().insert(server_virtual, server_public);
     // }
 
     let mut tun_iff = Some(tun::Tun::new(tun_name.clone())?
@@ -325,7 +320,15 @@ fn main() -> Result<()> {
             channel: cell::RefCell::new(receiver) };
 
         threads.push(Some(thread::spawn(move || -> Result<()> {
-            initialize_tunnel(cfg)
+            match initialize_tunnel(cfg) {
+                Err(err) => {
+                    error!(msg = "Thread exited with error", ?err);
+                    // give other threads a chance to fail as well
+                    thread::sleep(time::Duration::from_secs(1));
+                    // unrecoverable failure
+                    process::exit(1); }
+                Ok(_) => Ok(())
+            }
         })));
     }
 
@@ -346,9 +349,7 @@ fn main() -> Result<()> {
     }
 
     for i in 0..ncpus {
-        if let Err(err) = threads[i].take().unwrap().join().unwrap() {
-            eprintln!("Thread {}: {:?}", i, err);
-        }
+        threads[i].take().unwrap().join().unwrap()?;
     }
 
     Ok(())
