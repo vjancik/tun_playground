@@ -18,203 +18,37 @@ use smallvec::SmallVec;
 mod tun;
 mod runtime;
 
-// struct TunnelConfig {
-//     tun_name: String,
-//     tun_addr: net::Ipv4Addr,
-//     tun_iff: Option<tun::Tun>,
-//     tun_mask: u8,
-//     port: u16,
-//     thread_id: u8,
-//     gateway: Option<net::SocketAddr>,
-//     tun_to_udp: sync::Arc<RwLock<collections::HashMap<net::Ipv4Addr, net::SocketAddr>>>,
-//     // channel: cell::RefCell<mio::net::UnixDatagram>,
-// }
-
-// impl fmt::Debug for TunnelConfig {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         f.debug_struct("TunnelConfig")
-//          .field("tun_name", &self.tun_name)
-//          .field("tun_addr", &self.tun_addr)
-//          .field("tun_iff", &self.tun_iff)
-//          .field("tun_mask", &self.tun_mask)
-//          .field("port", &self.port)
-//          .field("thread_id", &self.thread_id)
-//          .field("gateway", &self.gateway)
-//          // TODO: doesn't print properly?
-//          .field("peer_table", &*self.tun_to_udp.read())
-//          .field("channel", &"UnixDatagram channel")
-//          .finish()
-//     }
-// }
-
-// fn initialize_tunnel(cfg: TunnelConfig) -> Result<()> 
-// {
-//     let tun_iff = match cfg.thread_id {
-//         0 => cfg.tun_iff.unwrap(),
-//         _ => {
-//             tun::Tun::new(cfg.tun_name)?
-//                 .set_non_blocking()?
-//         }
-//     };
-//     let mut tun_iff_flags: IoFlags = Default::default();
-//     let mut tun_unsent_frame_size = 0;
-//     let mut tun_buf = [0u8; tun::MAX_SAFE_MTU];
-        
-//     // let mtu = tun_iff.get_mtu()?;
-//     // println!("Interface MTU is: {}", mtu);
-    
-//     let mut poll = mio::Poll::new()?;
-//     let mut events = mio::Events::with_capacity(1000);
-    
-//     poll.registry().register(&mut mio::unix::SourceFd(&tun_iff.fd), TUN_IFF, 
-//         mio::Interest::READABLE.add(mio::Interest::WRITABLE))?;
-//     poll.registry().register(&mut udp_sock, PUBLIC_IFF, 
-//         mio::Interest::READABLE.add(mio::Interest::WRITABLE))?;
-//     poll.registry().register(&mut *cfg.channel.borrow_mut(), CHAN_TOKEN, mio::Interest::READABLE)?;
-
-//     let mut chan_buf = [0u8; 1];
-    
-//     'event_loop: loop {
-//         poll.poll(&mut events, None)?;
-
-//         for event in events.iter() {
-//             if event.token() == TUN_IFF {
-//                 // TUN read / write handler
-//                 loop {
-//                     if tun_iff_flags.should_read {
-//                         tun_unsent_frame_size = match unistd::read(tun_iff.fd, &mut tun_buf) {
-//                             Err(nix::Error::Sys(errno::EWOULDBLOCK)) => break,
-//                             any => any,
-//                         }?;
-//                     }
-//                     let tun_dest_ip: net::Ipv4Addr = byteorder::BigEndian::read_u32(&tun_buf[16..20]).into();
-//                     let peer_addr = match cfg.tun_to_udp.read().get(&tun_dest_ip) {
-//                         Some(addr) => addr.clone(),
-//                         _ => match &cfg.gateway {
-//                             Some(gateway) => gateway.clone(),
-//                             _ => {
-//                                 debug!(msg = "unknown peer", ?tun_dest_ip);
-//                                 continue
-//                             }
-
-//                         }
-//                     };
-                    
-//                     match udp_sock.send_to(&tun_buf[..tun_unsent_frame_size], peer_addr) {
-//                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-//                             tun_iff_flags.should_read = false;
-//                             break
-//                         },
-//                         Err(error) if error.kind() == io::ErrorKind::Other => {
-//                             if let Some(e_num) = io::Error::last_os_error().raw_os_error() {
-//                                 if errno::Errno::from_i32(e_num) == errno::Errno::ENETUNREACH {
-//                                     tun_iff_flags.should_read = false;
-//                                     break
-//                                 }
-//                             }
-//                             Err(error)
-//                         },
-//                         Err(any) => Err(any),
-//                         Ok(_) => {
-//                             tun_iff_flags.should_read = true; 
-//                             Ok(())
-//                         },
-//                     }?;
-//                 }
-//             } 
-//             else if event.token() == PUBLIC_IFF {
-//                 // UDP read / write handler
-//                 loop {
-//                     if udp_iff_flags.should_read {
-//                         let (nread, addr) = match udp_sock.recv_from(&mut udp_buf) {
-//                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-//                             any => any,
-//                         }?;
-//                         udp_unsent_frame_size = nread;
-
-//                         let tun_src_ip: net::Ipv4Addr = byteorder::BigEndian::read_u32(&udp_buf[12..16]).into();
-
-//                         let addr_tb = cfg.tun_to_udp.read();
-//                         if !addr_tb.contains_key(&tun_src_ip) {
-//                             info!(msg = "unknown peer, adding", ?tun_src_ip);
-//                             drop(addr_tb);
-//                             cfg.tun_to_udp.write().insert(tun_src_ip, addr);
-//                         } else {
-//                             let old_addr = addr_tb.get(&tun_src_ip).unwrap().clone();
-//                             // peer's IP address changed - unsecure
-//                             if old_addr != addr { 
-//                                 info!(msg = "updating peer's address", ?old_addr, ?addr, ?tun_src_ip);
-//                                 drop(addr_tb);
-//                                 cfg.tun_to_udp.write().insert(tun_src_ip, addr);
-//                             }
-//                         }
-//                     }
-
-//                     let tun_dst_ip: net::Ipv4Addr = byteorder::BigEndian::read_u32(&udp_buf[16..20]).into();
-//                     match tun_dst_ip == cfg.tun_addr {
-//                         true => {
-//                             match unistd::write(tun_iff.fd, &udp_buf[..udp_unsent_frame_size]) {
-//                                 Err(nix::Error::Sys(errno::EWOULDBLOCK)) => {
-//                                     udp_iff_flags.should_read = false;
-//                                     break
-//                                 },
-//                                 Err(any) => Err(any),
-//                                 Ok(_) => {
-//                                     udp_iff_flags.should_read = true;
-//                                     Ok(())
-//                                 },
-//                             }?;
-//                         }
-//                         false => {
-//                             if let Some(dst_ip) = cfg.tun_to_udp.read().get(&tun_dst_ip) {
-//                                 // TODO: MAJOR replication occuring
-//                                 match udp_sock.send_to(&udp_buf[..udp_unsent_frame_size], dst_ip.clone()) {
-//                                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-//                                         tun_iff_flags.should_read = false;
-//                                         break
-//                                     },
-//                                     Err(error) if error.kind() == io::ErrorKind::Other => {
-//                                         if let Some(e_num) = io::Error::last_os_error().raw_os_error() {
-//                                             if errno::Errno::from_i32(e_num) == errno::Errno::ENETUNREACH {
-//                                                 tun_iff_flags.should_read = false;
-//                                                 break
-//                                             }
-//                                         }
-//                                         Err(error)
-//                                     },
-//                                     Err(any) => Err(any) ,
-//                                     Ok(_) => {
-//                                         tun_iff_flags.should_read = true; 
-//                                         Ok(())
-//                                     },
-//                                 }?;
-//                             // TODO: gateway forward
-//                             } else { continue }
-//                         }
-//                     }
-
-//                 }
-//             }
-//             else if event.token() == CHAN_TOKEN {
-//                 loop {
-//                     cfg.channel.borrow_mut().recv(&mut chan_buf)?;
-//                     let signal = unsafe { mem::transmute::<u8, i8>(chan_buf[0])};
-//                     if signal == -1 {
-//                         break 'event_loop;
-//                     }
-//                 }
-//             }
-//         }
-//     }
-//     Ok(())
-// }
+fn handle_udp_send_result(result: io::Result<usize>) -> (io::Result<()>, bool) {
+    let mut send_successful = true;
+    let result = match result {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            send_successful = false;
+            Ok(())
+        },
+        Err(error) if error.kind() == io::ErrorKind::Other => {
+            match io::Error::last_os_error().raw_os_error() {
+                Some(e_num) if errno::Errno::from_i32(e_num) == errno::Errno::ENETUNREACH => {
+                    send_successful = false;
+                    Ok(())
+                }
+                Some(_) | None => Err(error)
+            }
+        },
+        Err(any) => {
+            send_successful = false;
+            Err(any)
+        },
+        Ok(_) => Ok(()),
+    };
+    (result, send_successful)
+}
 
 fn udp_handler_factory() -> Box<runtime::SourceEvHandler<ThreadData>>
 { Box::new(|_runtime, thread_data, _event| {
     let mut buf = [0u8; tun::MAX_SAFE_MTU];
     let mut last_frame_size = 0usize;
     let ThreadData { udp_should_read, tun_addr, tun_iff, tun_should_read, udp_socket,
-                     tun_to_udp, .. } = thread_data;
+                     tun_to_udp, gateway } = thread_data;
 
     loop {
         if *udp_should_read {
@@ -256,30 +90,20 @@ fn udp_handler_factory() -> Box<runtime::SourceEvHandler<ThreadData>>
                 }?;
             }
             false => {
+                // TODO: may fail to send but proceed to read again and rewrite it's own buffer
+                //       need a "wait for write readiness" control flag
                 if let Some(dst_ip) = tun_to_udp.get(&tun_dst_ip) {
-                    // TODO: MAJOR replication occuring
-                    match udp_socket.send_to(&buf[..last_frame_size], dst_ip.clone()) {
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            *tun_should_read = false;
-                            break
-                        },
-                        Err(error) if error.kind() == io::ErrorKind::Other => {
-                            if let Some(e_num) = io::Error::last_os_error().raw_os_error() {
-                                if errno::Errno::from_i32(e_num) == errno::Errno::ENETUNREACH {
-                                    *tun_should_read = false;
-                                    break
-                                }
-                            }
-                            Err(error)
-                        },
-                        Err(any) => Err(any) ,
-                        Ok(_) => {
-                            *tun_should_read = true; 
-                            Ok(())
-                        },
-                    }?;
-                // TODO: gateway forward
-                } else { continue }
+                    let send_result = udp_socket.send_to(&buf[..last_frame_size], dst_ip.clone());
+                    let (send_result, send_successful) = handle_udp_send_result(send_result);
+                    *tun_should_read = send_successful;
+                    send_result?;
+
+                } else if let Some(gateway) = &gateway { 
+                    let send_result = udp_socket.send_to(&buf[..last_frame_size], gateway.clone());
+                    let (send_result, send_successful) = handle_udp_send_result(send_result);
+                    *tun_should_read = send_successful;
+                    send_result?;
+                 }
             }
         }
     }
@@ -312,26 +136,11 @@ fn tun_handler_factory() -> Box<runtime::SourceEvHandler<ThreadData>>
             }
         };
         
-        match udp_socket.send_to(&buf[..last_frame_size], peer_addr) {
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                *tun_should_read = false;
-                break
-            },
-            Err(error) if error.kind() == io::ErrorKind::Other => {
-                if let Some(e_num) = io::Error::last_os_error().raw_os_error() {
-                    if errno::Errno::from_i32(e_num) == errno::Errno::ENETUNREACH {
-                        *tun_should_read = false;
-                        break
-                    }
-                }
-                Err(error)
-            },
-            Err(any) => Err(any),
-            Ok(_) => {
-                *tun_should_read = true; 
-                Ok(())
-            },
-        }?;
+        let send_result = udp_socket.send_to(&buf[..last_frame_size], peer_addr);
+        let (send_result, send_successful) = handle_udp_send_result(send_result);
+        *tun_should_read = send_successful;
+        send_result?;
+        if !*tun_should_read { break }
     }
     Ok(())
 })}
@@ -373,7 +182,6 @@ fn main() -> Result<()> {
     let tun_addr = clap::value_t!(matches, "virtual", net::Ipv4Addr)?;
     let tun_mask = clap::value_t!(matches, "mask", u8)?;
     let port = clap::value_t!(matches, "port", u16)?;
-    // let tun_to_udp = sync::Arc::new(RwLock::new(collections::HashMap::new()));
     
     let gateway = match matches.value_of("gateway") {
         Some(_) => Some(clap::value_t!(matches, "gateway", net::SocketAddr)?),
@@ -403,9 +211,6 @@ fn main() -> Result<()> {
         let udp_sock = Socket::new(Domain::ipv6(), Type::dgram().non_blocking(), Some(Protocol::udp()))?;
         udp_sock.set_reuse_address(true)?;
         udp_sock.set_reuse_port(true)?;
-        // let mut udp_iff_flags: IoFlags = Default::default();
-        // let mut udp_unsent_frame_size = 0;
-        // let mut udp_buf = [0u8; tun::MAX_SAFE_MTU];
         udp_sock.bind(&format!{"[::0]:{}", port}.parse::<net::SocketAddr>()?.into())?;
         udp_sockets.push(Some(mio::net::UdpSocket::from_std(udp_sock.into_udp_socket())));
     }
