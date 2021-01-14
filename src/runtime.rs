@@ -37,7 +37,7 @@ pub struct Runtime<TD: Send + Sync + 'static> {
 #[derive(Clone, Copy, PartialEq)]
 struct EventIndex(usize);
 
-/// Can trigger multiple times in rapid succession if multiple timer periods were missed
+/// Will trigger multiple times in rapid succession if multiple timer periods were missed
 struct TimerEvent<TD: Send + Sync + 'static> {
     //TODO: cancelling
     #[allow(dead_code)]
@@ -59,6 +59,7 @@ struct SourceEvent<TD: Send + Sync + 'static> {
     handler: Box<SourceEvHandler<TD>>
 }
 
+// TODO: busyness indicator flags, wake only one, inactive, thread
 fn wake_all<'a, T: Iterator<Item=&'a Arc<mio::Waker>>>(wakers: T) {
     for waker in wakers {
         waker.wake().ok();
@@ -206,6 +207,7 @@ impl<TD: Send + Sync + 'static> Runtime<TD> {
         let source_token = self.get_next_token();
         let interests = interests.unwrap_or(mio::Interest::READABLE.add(mio::Interest::WRITABLE));
 
+        // TODO: Error from None
         if let Some(poll) = &self.polls[thread_id] {
             poll.registry().register(source, source_token, interests)?;
         }

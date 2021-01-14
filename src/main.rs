@@ -145,12 +145,57 @@ fn tun_handler_factory() -> Box<runtime::SourceEvHandler<ThreadData>>
     Ok(())
 })}
 
+// Action flow:
+//      1. at startup, discover mapped address through stun
+//      2. send data to a an unknown tun IP 
+//      3. data flows through gateway, at the same time, ask the sync server to
+
+enum UDPMsgType {
+    Keepalive,
+    Stun,
+    TunData,
+}
+
+struct UDPProtocolFrame {
+    msg_t: UDPMsgType,
+}
+
+enum SyncMsgType {
+    RequestDirect, // transaction_id
+    RequestAccepted, // with transaction_id
+    RequestDenied, // transaction_id, and failure explanation, either enum or msg TLV 
+    // Acknowledge, // probably redundant on TCP keepalive connections
+}
+
+struct SyncProtocolFrame {
+    msg_t: SyncMsgType
+}
+
+// discovery from sync server
+struct Peer {
+    tun_addr: net::Ipv4Addr,
+    pub_addr: net::SocketAddr,
+    direct: bool, // false means you should send the packets to the gateway or drop
+}
+
+struct SharedData {
+    mapped_ip: Option<net::SocketAddr>,
+    /// cache timeout for mapped_ip, to be refreshed
+    mapped_freshness: std::time::Instant, // or SystemTime?
+    peer_table: SmallVec<[Peer; 5]>,
+}
+
+trait SyncClient {
+    fn request_direct_connection();
+}
+
 
 struct ThreadData {
     tun_iff: unix::io::RawFd,
     tun_addr: net::Ipv4Addr,
     udp_socket: mio::net::UdpSocket,
     gateway: Option<net::SocketAddr>,
+    // sync_server: Option<net::SocketAddr>,
     tun_to_udp: collections::HashMap<net::Ipv4Addr, net::SocketAddr>,
     udp_should_read: bool,
     tun_should_read: bool,
